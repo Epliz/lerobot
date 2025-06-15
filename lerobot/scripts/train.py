@@ -28,6 +28,7 @@ from lerobot.common.datasets.factory import make_dataset
 from lerobot.common.datasets.sampler import EpisodeAwareSampler
 from lerobot.common.datasets.utils import cycle
 from lerobot.common.envs.factory import make_env
+from lerobot.common.lora.replacement import replace_back_layers, replace_layers
 from lerobot.common.optim.factory import make_optimizer_and_scheduler
 from lerobot.common.policies.factory import make_policy
 from lerobot.common.policies.pretrained import PreTrainedPolicy
@@ -49,8 +50,19 @@ from lerobot.common.utils.utils import (
 )
 from lerobot.common.utils.wandb_utils import WandBLogger
 from lerobot.configs import parser
+from lerobot.configs.lora import LoRaConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.scripts.eval import eval_policy
+
+
+def _apply_lora(lora_config: LoRaConfig, policy: PreTrainedPolicy, device):
+    policy = replace_layers(policy, lora_config, device=device)
+    return policy
+
+
+def _merge_back_lora(lora_config: LoRaConfig, policy: PreTrainedPolicy, device):
+    policy = replace_back_layers(policy, lora_config, device=device)
+    return policy
 
 
 def update_policy(
@@ -133,13 +145,20 @@ def train(cfg: TrainPipelineConfig):
     eval_env = None
     if cfg.eval_freq > 0 and cfg.env is not None:
         logging.info("Creating env")
-        eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
+        eval_env = make_env(
+            cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs
+        )
 
     logging.info("Creating policy")
     policy = make_policy(
         cfg=cfg.policy,
         ds_meta=dataset.meta,
     )
+
+    # Use LoRa if necessary
+    if cfg.lora_config is not None:
+        logging.info("Applying LoRa to the policy")
+        policy = _apply_lora(cfg.lora_config, policy, device)
 
     logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
@@ -148,12 +167,18 @@ def train(cfg: TrainPipelineConfig):
     step = 0  # number of policy updates (forward + backward + optim)
 
     if cfg.resume:
-        step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
+        step, optimizer, lr_scheduler = load_training_state(
+            cfg.checkpoint_path, optimizer, lr_scheduler
+        )
 
-    num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+    num_learnable_params = sum(
+        p.numel() for p in policy.parameters() if p.requires_grad
+    )
     num_total_params = sum(p.numel() for p in policy.parameters())
 
-    logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
+    logging.info(
+        colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}"
+    )
     if cfg.env is not None:
         logging.info(f"{cfg.env.task=}")
     logging.info(f"{cfg.steps=} ({format_big_number(cfg.steps)})")
@@ -196,7 +221,11 @@ def train(cfg: TrainPipelineConfig):
     }
 
     train_tracker = MetricsTracker(
-        cfg.batch_size, dataset.num_frames, dataset.num_episodes, train_metrics, initial_step=step
+        cfg.batch_size,
+        dataset.num_frames,
+        dataset.num_episodes,
+        train_metrics,
+        initial_step=step,
     )
 
     logging.info("Start offline training on a fixed dataset")
@@ -225,7 +254,7 @@ def train(cfg: TrainPipelineConfig):
         step += 1
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
-        is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
+        is_saving_step = step % cfg.save_freq == 0
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
 
         if is_log_step:
@@ -250,7 +279,11 @@ def train(cfg: TrainPipelineConfig):
             logging.info(f"Eval policy at step {step}")
             with (
                 torch.no_grad(),
-                torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext(),
+                (
+                    torch.autocast(device_type=device.type)
+                    if cfg.policy.use_amp
+                    else nullcontext()
+                ),
             ):
                 eval_info = eval_policy(
                     eval_env,
@@ -267,7 +300,11 @@ def train(cfg: TrainPipelineConfig):
                 "eval_s": AverageMeter("eval_s", ":.3f"),
             }
             eval_tracker = MetricsTracker(
-                cfg.batch_size, dataset.num_frames, dataset.num_episodes, eval_metrics, initial_step=step
+                cfg.batch_size,
+                dataset.num_frames,
+                dataset.num_episodes,
+                eval_metrics,
+                initial_step=step,
             )
             eval_tracker.eval_s = eval_info["aggregated"].pop("eval_s")
             eval_tracker.avg_sum_reward = eval_info["aggregated"].pop("avg_sum_reward")
@@ -277,6 +314,21 @@ def train(cfg: TrainPipelineConfig):
                 wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
                 wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
                 wandb_logger.log_video(eval_info["video_paths"][0], step, mode="eval")
+
+    # Merge LoRa back layers if necessary
+    if cfg.lora_config is not None:
+        logging.info("Merging back LoRa layers")
+        policy = _merge_back_lora(cfg.lora_config, policy, device)
+
+    # Save final checkpoint
+    if cfg.save_checkpoint:
+        logging.info(f"Final checkpoint")
+
+        checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+        save_checkpoint(checkpoint_dir, step, cfg, policy, optimizer, lr_scheduler)
+        update_last_checkpoint(checkpoint_dir)
+        if wandb_logger:
+            wandb_logger.log_policy(checkpoint_dir)
 
     if eval_env:
         eval_env.close()

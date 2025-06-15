@@ -27,6 +27,7 @@ from lerobot.common.optim.schedulers import LRSchedulerConfig
 from lerobot.common.utils.hub import HubMixin
 from lerobot.configs import parser
 from lerobot.configs.default import DatasetConfig, EvalConfig, WandBConfig
+from lerobot.configs.lora import LoRaConfig
 from lerobot.configs.policies import PreTrainedConfig
 
 TRAIN_CONFIG_NAME = "train_config.json"
@@ -59,6 +60,7 @@ class TrainPipelineConfig(HubMixin):
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
     use_policy_training_preset: bool = True
+    lora_config: LoRaConfig | None = None
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
     eval: EvalConfig = field(default_factory=EvalConfig)
@@ -73,7 +75,9 @@ class TrainPipelineConfig(HubMixin):
         if policy_path:
             # Only load the policy config
             cli_overrides = parser.get_cli_overrides("policy")
-            self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
+            self.policy = PreTrainedConfig.from_pretrained(
+                policy_path, cli_overrides=cli_overrides
+            )
             self.policy.pretrained_path = policy_path
         elif self.resume:
             # The entire train config is already loaded, we just need to get the checkpoint dir
@@ -97,7 +101,11 @@ class TrainPipelineConfig(HubMixin):
             else:
                 self.job_name = f"{self.env.type}_{self.policy.type}"
 
-        if not self.resume and isinstance(self.output_dir, Path) and self.output_dir.is_dir():
+        if (
+            not self.resume
+            and isinstance(self.output_dir, Path)
+            and self.output_dir.is_dir()
+        ):
             raise FileExistsError(
                 f"Output directory {self.output_dir} already exists and resume is {self.resume}. "
                 f"Please change your output directory so that {self.output_dir} is not overwritten."
@@ -108,10 +116,16 @@ class TrainPipelineConfig(HubMixin):
             self.output_dir = Path("outputs/train") / train_dir
 
         if isinstance(self.dataset.repo_id, list):
-            raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
+            raise NotImplementedError(
+                "LeRobotMultiDataset is not currently implemented."
+            )
 
-        if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
-            raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")
+        if not self.use_policy_training_preset and (
+            self.optimizer is None or self.scheduler is None
+        ):
+            raise ValueError(
+                "Optimizer and Scheduler must be set when the policy presets are not used."
+            )
         elif self.use_policy_training_preset and not self.resume:
             self.optimizer = self.policy.get_optimizer_preset()
             self.scheduler = self.policy.get_scheduler_preset()
@@ -125,7 +139,10 @@ class TrainPipelineConfig(HubMixin):
         return draccus.encode(self)
 
     def _save_pretrained(self, save_directory: Path) -> None:
-        with open(save_directory / TRAIN_CONFIG_NAME, "w") as f, draccus.config_type("json"):
+        with (
+            open(save_directory / TRAIN_CONFIG_NAME, "w") as f,
+            draccus.config_type("json"),
+        ):
             draccus.dump(self, f, indent=4)
 
     @classmethod
@@ -176,4 +193,6 @@ class TrainPipelineConfig(HubMixin):
 
 @dataclass(kw_only=True)
 class TrainRLServerPipelineConfig(TrainPipelineConfig):
-    dataset: DatasetConfig | None = None  # NOTE: In RL, we don't need an offline dataset
+    dataset: DatasetConfig | None = (
+        None  # NOTE: In RL, we don't need an offline dataset
+    )
